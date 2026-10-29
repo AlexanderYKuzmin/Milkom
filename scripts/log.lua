@@ -1,13 +1,7 @@
 -- log.lua
 -- Общий модуль логирования для скриптов Simplight.
 -- Пишет сообщения в общий Журнал событий через funcs.logEvents.
---
--- Использование:
---   local log = require("log")
---   log.info("lenin_flow_water", "расход в норме")
---   log.infoF("lenin_flow_water", "мгнов=%.3f, сутки=%.3f", flow, day)
---   log.warnF("scheduler", "шаг SLOW %d/%d %s dt=%d мс", i, n, label, dt)
---   log.alarmF("scheduler", "шаг ALARM %d/%d %s: %s", i, n, label, err)
+
 --
 -- Уровни:
 --   info  — обычные информационные сообщения
@@ -32,7 +26,7 @@ local function emit(eventType, tag, text)
   local ok, err = pcall(function()
     funcs.logEvents({
       type = eventType,
-      text = string.format("[%s] %s", tag, text),
+      text = string.format("%s", text),
     })
   end)
   if not ok then

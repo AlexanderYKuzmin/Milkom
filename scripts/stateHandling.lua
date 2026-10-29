@@ -6,7 +6,7 @@ local log = require("log")
 
 local M = {}
 
-local LOG_TAG = "state_alarm"
+local LOG_TAG = ""
 
 -- Соответствие тегов и читаемых имён.
 -- Порядок соответствует порядку опроса в READING_LIST.
