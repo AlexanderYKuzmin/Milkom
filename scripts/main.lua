@@ -1,3 +1,3 @@
-local setAlarmThr = require("setAlarmThr")
+local stateHandling = require("stateHandling")
 
-setAlarmThr.start()
+stateHandling.start()
