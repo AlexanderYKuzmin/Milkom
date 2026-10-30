@@ -1,3 +1,3 @@
 local stateHandling = require("stateHandling")
 
-stateHandling.start()
+--stateHandling.start()
