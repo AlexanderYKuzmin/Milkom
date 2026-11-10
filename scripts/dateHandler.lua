@@ -1,16 +1,21 @@
-local async  = require("async")
-local promise = require("promise")
-local tagApi = require("simplight.api.channels")
-local events = require("simp-events")
-local log    = require("log")
-local countDataPeriod = require("countDataPeriod")
+-- dateHandler.lua
+-- Изменение общей даты (Дата_Начало / Дата_Конец) ->
+-- последовательный расчёт по всем расходомерам ->
+-- запись в теги N_Ср_расх_период, N_Макс_расх_период,
+-- N_Мин_расх_период, N_Потребление_период.
+local async      = require("async")
+local promise    = require("promise")
+local tagApi     = require("simplight.api.channels")
+local events     = require("simp-events")
+local momentApi  = require("moments")
+local logger     = require("logger")
 
 local M = {}
 
-local LOG_TAG = ""
+local LOG_TAG = "dateHandler"
 local QUALITY_GOOD = 0xC0
 
--- В SimpLight 5.0 в async нет sleep — пауза через setInterval + promise.
+-- sleep через setInterval + promise (в Simplight 5.0 в async нет sleep)
 local function sleepMs(ms)
   return promise:new(function(resolve)
     local timerId = setInterval(function()
@@ -20,11 +25,22 @@ local function sleepMs(ms)
   end)
 end
 
+local function toNum(v)
+  if v == nil then return nil end
+  return tonumber(v)
+end
+
+local function toMs(v)
+  return toNum(v)  -- datetime в Simplight приходит числом мс
+end
+
+-- ==== Общие даты ====
 local CH_R = {
   START_MAIN  = "Дата_Начало",
   FINISH_MAIN = "Дата_Конец"
 }
 
+-- ==== Расходомеры ====
 local COUNTERS = {
   { n = 1,  fm = "FM-1"  },
   { n = 2,  fm = "FM-2"  },
@@ -36,245 +52,201 @@ local COUNTERS = {
   { n = 22, fm = "FM-22" },
 }
 
-local counterByStartTag  = {}
-local counterByFinishTag = {}
-
 for _, c in ipairs(COUNTERS) do
   local prefix = c.n .. "_"
-  c.startTag       = prefix .. "Дата_Начало"
-  c.finishTag      = prefix .. "Дата_Конец"
   c.source         = "Тв_цех." .. c.fm .. ".Reg_R.SCo_Расход"
   c.volumeSource   = "Тв_цех." .. c.fm .. ".Reg_R.SCo_Объем"
   c.avgTag         = prefix .. "Ср_расх_период"
   c.maxTag         = prefix .. "Макс_расх_период"
   c.minTag         = prefix .. "Мин_расх_период"
   c.consumptionTag = prefix .. "Потребление_период"
-
-  counterByStartTag[c.startTag]   = c
-  counterByFinishTag[c.finishTag] = c
 end
 
 -- ==== Состояние ====
 local warmup = true
 local lastMainStart  = nil
 local lastMainFinish = nil
+local inProgress = false
 
--- lastWritten — только для отсечения эха собственной записи.
--- Храним { value, expireAt } — на случай, если эхо не придёт.
-local lastWritten = {}
-local LAST_WRITTEN_TTL_MS = 3000
+-- ==== Один проход по одному расходомеру ====
+-- Полноценная async-функция (возвращает промис).
+-- Внутри — только await, как в oct_report_data_period.
+local function calcOneCounter(counter, tStart, tEnd)
+  return async(function()
+    local optsFlow = {
+      channelName = counter.source,
+      start = tStart,
+      ending = tEnd,
+    }
 
-local function nowMs()
-  return os.time() * 1000
+    local avg  = await(momentApi.getAverage(optsFlow))
+    local maxV = await(momentApi.getMax(optsFlow))
+    local minV = await(momentApi.getMin(optsFlow))
+
+    if avg == nil then
+      logger.warnF(LOG_TAG, "counter=%d: no avg data for %s", counter.n, counter.source)
+    end
+    if maxV == nil then
+      logger.warnF(LOG_TAG, "counter=%d: no max data for %s", counter.n, counter.source)
+    end
+    if minV == nil then
+      logger.warnF(LOG_TAG, "counter=%d: no min data for %s", counter.n, counter.source)
+    end
+
+    -- Потребление по объёму
+    local consumption
+    if counter.volumeSource and counter.consumptionTag then
+      local optsVol = { channelName = counter.volumeSource, start = tStart, ending = tEnd }
+      local vMin = await(momentApi.getMin(optsVol))
+      local vMax = await(momentApi.getMax(optsVol))
+      if vMin ~= nil and vMax ~= nil then
+        local a, b = toNum(vMin), toNum(vMax)
+        if a ~= nil and b ~= nil then
+          consumption = b - a
+          if consumption < 0 then
+            logger.warnF(LOG_TAG,
+              "counter=%d: negative consumption (%s) for %s, set 0",
+              counter.n, tostring(consumption), counter.volumeSource)
+            consumption = 0
+          end
+        end
+      else
+        logger.warnF(LOG_TAG, "counter=%d: no volume data for %s",
+          counter.n, counter.volumeSource)
+      end
+    end
+
+    -- Собираем значения для записи
+    local values = {}
+    if counter.avgTag and avg ~= nil then
+      values[#values + 1] = { name = counter.avgTag, value = avg, quality = QUALITY_GOOD }
+    end
+    if counter.maxTag and maxV ~= nil then
+      values[#values + 1] = { name = counter.maxTag, value = maxV, quality = QUALITY_GOOD }
+    end
+    if counter.minTag and minV ~= nil then
+      values[#values + 1] = { name = counter.minTag, value = minV, quality = QUALITY_GOOD }
+    end
+    if counter.consumptionTag and consumption ~= nil then
+      values[#values + 1] = { name = counter.consumptionTag, value = consumption, quality = QUALITY_GOOD }
+    end
+
+    logger.infoF(LOG_TAG,
+      "counter=%d: avg=%s max=%s min=%s cons=%s, write %d tag(s)",
+      counter.n, tostring(avg), tostring(maxV), tostring(minV), tostring(consumption), #values)
+
+    if #values > 0 then
+      await(tagApi.writeMany({ values = values }))
+      logger.infoF(LOG_TAG, "counter=%d: writeMany OK (%d tag(s))", counter.n, #values)
+    else
+      logger.warnF(LOG_TAG, "counter=%d: nothing to write", counter.n)
+    end
+  end)
 end
 
--- ==== Запись ====
-local function writeManySafe(values, label, onDone)
-  if not values or #values == 0 then
-    if onDone then onDone(true) end
+-- ==== Обработка изменения общей даты ====
+-- Одна async-функция на всё изменение. Внутри — последовательный цикл
+-- с await(calcOneCounter(...)). Каждый calcOneCounter — свой async.
+local function onMainDateChanged()
+  if inProgress then
+    logger.info(LOG_TAG, "calc already in progress, skip")
     return
   end
-
-  local expireAt = nowMs() + LAST_WRITTEN_TTL_MS
-  for _, v in ipairs(values) do
-    lastWritten[v.name] = { value = v.value, expireAt = expireAt }
-  end
+  inProgress = true
 
   async(function()
-    await(tagApi.writeMany({ values = values }))
-    if onDone then onDone(true) end
-  end):catch(function(err)
-    log.warn(LOG_TAG, label .. " writeMany failed: " .. tostring(err))
-    for _, v in ipairs(values) do
-      local lw = lastWritten[v.name]
-      if lw and lw.value == v.value then
-        lastWritten[v.name] = nil
-      end
-    end
-    if onDone then onDone(false) end
-  end)
-end
+    -- 1) читаем обе даты одним readMany
+    local res = await(tagApi.readMany({ CH_R.START_MAIN, CH_R.FINISH_MAIN }))
+    local sTag = res and res[1]
+    local fTag = res and res[2]
+    local s = sTag and toMs(sTag.value)
+    local f = fTag and toMs(fTag.value)
 
--- ==== Расчёт по расходомеру ====
-local function runCounterCalc(counter, tStartOverride, tEndOverride)
-  async(function()
-    local tStart = tStartOverride
-    local tEnd   = tEndOverride
+    logger.infoF(LOG_TAG, "readMainDates: start=%s, finish=%s", tostring(s), tostring(f))
 
-    if tStart == nil or tEnd == nil then
-      local tags = await(tagApi.readMany({ counter.startTag, counter.finishTag }))
-      local sTag = tags and tags[1]
-      local fTag = tags and tags[2]
-
-      if not sTag or not fTag then
-        log.warnF(LOG_TAG, "runCounterCalc(%d): не удалось прочитать даты", counter.n)
-        return
-      end
-      if sTag.quality ~= QUALITY_GOOD or fTag.quality ~= QUALITY_GOOD then
-        log.warnF(LOG_TAG, "runCounterCalc(%d): плохое качество дат", counter.n)
-        return
-      end
-
-      tStart = tStart or tonumber(sTag.value)
-      tEnd   = tEnd   or tonumber(fTag.value)
-    end
-
-    if tStart == nil or tEnd == nil then
-      log.warnF(LOG_TAG, "runCounterCalc(%d): даты = nil", counter.n)
+    if s == nil or f == nil then
+      logger.warn(LOG_TAG, "one of dates is nil, skip")
       return
     end
-    if tEnd <= tStart then
-      log.warnF(LOG_TAG, "runCounterCalc(%d): некорректный период %s..%s",
-        counter.n, tostring(tStart), tostring(tEnd))
+    if s == lastMainStart and f == lastMainFinish then
+      logger.info(LOG_TAG, "dates unchanged, skip")
+      return
+    end
+    lastMainStart  = s
+    lastMainFinish = f
+
+    if f <= s then
+      logger.warnF(LOG_TAG, "finish <= start (%s..%s), skip", tostring(s), tostring(f))
       return
     end
 
-    countDataPeriod.countDataPeriod({
-      source         = counter.source,
-      volumeSource   = counter.volumeSource,
-      avgTag         = counter.avgTag,
-      maxTag         = counter.maxTag,
-      minTag         = counter.minTag,
-      consumptionTag = counter.consumptionTag,
-      period         = { start = tStart, finish = tEnd },
-    })
+    logger.infoF(LOG_TAG, "period updated: %s..%s", tostring(s), tostring(f))
+
+    -- 2) последовательный расчёт по всем расходомерам
+    for _, c in ipairs(COUNTERS) do
+      logger.infoF(LOG_TAG, "runCounterCalc(%d): %s..%s", c.n, tostring(s), tostring(f))
+      await(calcOneCounter(c, s, f))
+    end
+
+    logger.info(LOG_TAG, "all counters processed")
   end):catch(function(err)
-    log.warn(LOG_TAG, "runCounterCalc(" .. counter.n .. ") error: " .. tostring(err))
-  end)
-end
-
-local function runAllCounters(tStart, tEnd)
-  for _, c in ipairs(COUNTERS) do
-    runCounterCalc(c, tStart, tEnd)
-  end
-end
-
--- ==== Разнос общих дат по префиксным ====
-local START_TAGS  = {}
-local FINISH_TAGS = {}
-for _, c in ipairs(COUNTERS) do
-  START_TAGS[#START_TAGS + 1]   = c.startTag
-  FINISH_TAGS[#FINISH_TAGS + 1] = c.finishTag
-end
-
-local function buildValues(list, value)
-  local values = {}
-  for _, tagName in ipairs(list) do
-    values[#values + 1] = { name = tagName, value = value, quality = QUALITY_GOOD }
-  end
-  return values
-end
-
-local function writeStartTags(value)
-  if value == nil then
-    log.warn(LOG_TAG, "START: value=nil, пропуск записи")
-    return
-  end
-  writeManySafe(buildValues(START_TAGS, value), "START", function(ok)
-    if ok then runAllCounters(value, nil)
-    else log.warn(LOG_TAG, "START: пропускаем расчёт") end
-  end)
-end
-
-local function writeFinishTags(value)
-  if value == nil then
-    log.warn(LOG_TAG, "FINISH: value=nil, пропуск записи")
-    return
-  end
-  writeManySafe(buildValues(FINISH_TAGS, value), "FINISH", function(ok)
-    if ok then runAllCounters(nil, value)
-    else log.warn(LOG_TAG, "FINISH: пропускаем расчёт") end
-  end)
-end
-
--- ==== Обработка локальной даты ====
-local function handleLocalDateChange(change)
-  local name = change.name
-  local counter = counterByStartTag[name] or counterByFinishTag[name]
-  if not counter then
-    return false
-  end
-
-  -- отсечь эхо собственной записи (с учётом TTL)
-  local lw = lastWritten[name]
-  if lw then
-    if nowMs() <= lw.expireAt and lw.value == change.value then
-      lastWritten[name] = nil
-      return true
+    local msg = tostring(err)
+    if msg:find("context canceled", 1, true) then
+      logger.warn(LOG_TAG, "onMainDateChanged: cancelled by reload")
+    else
+      logger.warnF(LOG_TAG, "onMainDateChanged error: %s", msg)
     end
-    if nowMs() > lw.expireAt then
-      lastWritten[name] = nil
-    end
-  end
-
-  local v = tonumber(change.value)
-  if v == nil then
-    log.warnF(LOG_TAG, "Изменена локальная дата %s, но value=nil", name)
-    return true
-  end
-
-  log.infoF(LOG_TAG, "Изменена локальная дата %s, пересчёт расходомера %d", name, counter.n)
-
-  if name == counter.startTag then
-    runCounterCalc(counter, v, nil)
-  else
-    runCounterCalc(counter, nil, v)
-  end
-  return true
+  end):finally(function()
+    inProgress = false
+  end)
 end
 
 -- ==== Старт/стоп ====
 local handler
 
 function M.start()
+  logger.info(LOG_TAG, "=== start() ===")
   warmup = true
 
+  -- Страховка: через 3 с warmup снимается принудительно.
+  if setTimeout then
+    setTimeout(function()
+      if warmup then
+        warmup = false
+        logger.info(LOG_TAG, "warmup снят по таймауту 3с")
+      end
+    end, 3000)
+  end
+
+  -- Инициализация: читаем текущие даты, ставим lastMain*, не запускаем расчёт.
   async(function()
     local res = await(tagApi.readMany({ CH_R.START_MAIN, CH_R.FINISH_MAIN }))
-    local s = res and res[1] and tonumber(res[1].value)
-    local f = res and res[2] and tonumber(res[2].value)
+    local s = res and res[1] and toMs(res[1].value)
+    local f = res and res[2] and toMs(res[2].value)
     lastMainStart  = s
     lastMainFinish = f
-    log.infoF(LOG_TAG, "init: Дата_Начало=%s, Дата_Конец=%s",
-      tostring(s), tostring(f))
+    logger.infoF(LOG_TAG, "init: start=%s, finish=%s", tostring(s), tostring(f))
 
-    -- дать платформе выдать весь «залп» стартовых channelChanges
     await(sleepMs(1000))
     warmup = false
-    log.info(LOG_TAG, "warmup завершён")
+    logger.info(LOG_TAG, "warmup завершён, слушаю изменения")
   end):catch(function(err)
-    log.warn(LOG_TAG, "init error: " .. tostring(err))
+    logger.warnF(LOG_TAG, "init error: %s", tostring(err))
     warmup = false
   end)
 
   handler = function(event)
     for _, c in ipairs(event.changes or {}) do
-      if warmup then
-        goto continue
-      end
+      if c.name == CH_R.START_MAIN or c.name == CH_R.FINISH_MAIN then
+        logger.infoF(LOG_TAG, "change: name=%s type=%s value=%s%s",
+          tostring(c.name), type(c.value), tostring(c.value),
+          warmup and " [warmup]" or "")
 
-      if c.name == CH_R.START_MAIN then
-        local v = tonumber(c.value)
-        if v == nil then
-          log.warn(LOG_TAG, "START: value=nil, пропуск")
-        elseif lastMainStart == v then
-          -- дубль
-        else
-          lastMainStart = v
-          writeStartTags(v)
+        if warmup then
+          goto continue
         end
-      elseif c.name == CH_R.FINISH_MAIN then
-        local v = tonumber(c.value)
-        if v == nil then
-          log.warn(LOG_TAG, "FINISH: value=nil, пропуск")
-        elseif lastMainFinish == v then
-          -- дубль
-        else
-          lastMainFinish = v
-          writeFinishTags(v)
-        end
-      else
-        handleLocalDateChange(c)
+
+        onMainDateChanged()
       end
 
       ::continue::
@@ -282,12 +254,14 @@ function M.start()
   end
 
   events.on("channelChanges", handler)
+  logger.info(LOG_TAG, "subscribed to channelChanges")
 end
 
 function M.stop()
   if handler then
     events.off("channelChanges", handler)
     handler = nil
+    logger.info(LOG_TAG, "stop(): unsubscribed")
   end
 end
 
