@@ -41,21 +41,43 @@ local CH_R = {
 }
 
 -- ==== Расходомеры ====
+-- ==== Расходомеры (все 22) ====
+-- group — корневая группа проекта (для source/volumeSource, они modbus)
+-- Теги записи (Архив) — виртуальные, пишутся по КОРОТКОМУ имени.
 local COUNTERS = {
-  { n = 1,  fm = "FM-1"  },
-  { n = 2,  fm = "FM-2"  },
-  { n = 3,  fm = "FM-3"  },
-  { n = 4,  fm = "FM-4"  },
-  { n = 5,  fm = "FM-5"  },
-  { n = 6,  fm = "FM-6"  },
-  { n = 7,  fm = "FM-7"  },
-  { n = 22, fm = "FM-22" },
+  -- Тв_цех
+  { n = 1,  fm = "FM-1",  group = "Тв_цех" },
+  { n = 2,  fm = "FM-2",  group = "Тв_цех" },
+  { n = 3,  fm = "FM-3",  group = "Тв_цех" },
+  { n = 4,  fm = "FM-4",  group = "Тв_цех" },
+  { n = 5,  fm = "FM-5",  group = "Тв_цех" },
+  { n = 6,  fm = "FM-6",  group = "Тв_цех" },
+  { n = 7,  fm = "FM-7",  group = "Тв_цех" },
+  { n = 22, fm = "FM-22", group = "Тв_цех" },
+  -- Цех_СП_Норм
+  { n = 8,  fm = "FM-8",  group = "Цех_СП_Норм" },
+  { n = 9,  fm = "FM-9",  group = "Цех_СП_Норм" },
+  { n = 10, fm = "FM-10", group = "Цех_СП_Норм" },
+  { n = 11, fm = "FM-11", group = "Цех_СП_Норм" },
+  { n = 12, fm = "FM-12", group = "Цех_СП_Норм" },
+  { n = 13, fm = "FM-13", group = "Цех_СП_Норм" },
+  { n = 14, fm = "FM-14", group = "Цех_СП_Норм" },
+  { n = 15, fm = "FM-15", group = "Цех_СП_Норм" },
+  { n = 16, fm = "FM-16", group = "Цех_СП_Норм" },
+  { n = 17, fm = "FM-17", group = "Цех_СП_Норм" },
+  { n = 18, fm = "FM-18", group = "Цех_СП_Норм" },
+  { n = 19, fm = "FM-19", group = "Цех_СП_Норм" },
+  { n = 20, fm = "FM-20", group = "Цех_СП_Норм" },
+  { n = 21, fm = "FM-21", group = "Цех_СП_Норм" },
 }
 
 for _, c in ipairs(COUNTERS) do
+  local base = c.group .. "." .. c.fm
   local prefix = c.n .. "_"
-  c.source         = "Тв_цех." .. c.fm .. ".Reg_R.SCo_Расход"
-  c.volumeSource   = "Тв_цех." .. c.fm .. ".Reg_R.SCo_Объем"
+  -- Источники для momentApi — полный путь (modbus-теги)
+  c.source       = base .. ".Reg_R.SCo_Расход"
+  c.volumeSource = base .. ".Reg_R.SCo_Объем"
+  -- Теги записи — КОРОТКОЕ имя (виртуальные теги)
   c.avgTag         = prefix .. "Ср_расх_период"
   c.maxTag         = prefix .. "Макс_расх_период"
   c.minTag         = prefix .. "Мин_расх_период"
